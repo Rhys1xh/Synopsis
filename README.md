@@ -20,16 +20,16 @@ A single PowerShell script that transforms any Windows machine into a **fully au
 
 ###  Key Capabilities
 
-- ** Deep Hardware Inventory** — CPU, GPU, RAM, disks, network, PCI devices, USB, TPM, battery, and more
-- ** Thermal Monitoring** — NVIDIA and AMD GPU temperatures with multiple fallback methods
-- ** Storage Health** — SMART attributes, NVMe wear leveling, read/write latency, error counts
-- ** Network Intelligence** — Jumbo frames, VLAN, RSS, TCP offload, buffer sizes
-- ** Performance Metrics** — 27 real-time counters across CPU, memory, disk, and network
-- ** Change Detection** — Compare snapshots to identify hardware modifications
-- ** Driver Updates** — Windows Update driver availability awareness
+- ** Deep Hardware Inventory**  CPU, GPU, RAM, disks, network, PCI devices, USB, TPM, battery, and more
+- ** Thermal Monitoring**  NVIDIA and AMD GPU temperatures with multiple fallback methods
+- ** Storage Health**  SMART attributes, NVMe wear leveling, read/write latency, error counts
+- ** Network Intelligence**  Jumbo frames, VLAN, RSS, TCP offload, buffer sizes
+- ** Performance Metrics**  27 real-time counters across CPU, memory, disk, and network
+- ** Change Detection**  Compare snapshots to identify hardware modifications
+- ** Driver Updates**  Windows Update driver availability awareness
 - ** Remote & Batch** — Single-system, remote CIM, or fleet-wide batch scanning
-- ** Multi-Format Export** — JSON, CSV, and professional dark-themed HTML reports
-- ** Operational Logging** — Timestamped diagnostic logs with severity levels
+- ** Multi-Format Export**  JSON, CSV, and professional dark-themed HTML reports
+- ** Operational Logging**  Timestamped diagnostic logs with severity levels
 
 ---
 
