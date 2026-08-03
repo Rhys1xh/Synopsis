@@ -1,0 +1,16 @@
+[Compat]
+ps1=>NT22H2(19045\\6466)
+  ..min.WinAPI(10.0.10240\\*) {lpc(osvn)->Get-ParentItem(1507\"Threshold 1"\bin\2015)}
+ps1=>NT23H2(*\\*)
+  ..min.WinAPI(any)
+ps1=>NT24H2(*\\*)
+  ..min.WinAPI(any)
+ps1=>NT25H2(*\\*)
+  ..min.WinAPI(any)
+ps1=>NT26H2(*\\*)
+  ..min.WinAPI(any)
+[Cdef]
+
+[NOTE^]Running this tool on (older) kernel builds other than the ones listed, may cause (COMPAT)ibility issues. 
+^      This tool is actively maintained and can be integrated seamlessly without any headaches.
+^      For any further help/contact, feel free to send me an email (timucindanaci@web.de).
