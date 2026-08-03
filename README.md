@@ -27,7 +27,7 @@ A single PowerShell script that transforms any Windows machine into a **fully au
 - ** Performance Metrics**  27 real-time counters across CPU, memory, disk, and network
 - ** Change Detection**  Compare snapshots to identify hardware modifications
 - ** Driver Updates**  Windows Update driver availability awareness
-- ** Remote & Batch** — Single-system, remote CIM, or fleet-wide batch scanning
+- ** Remote & Batch** Single-system, remote CIM, or fleet-wide batch scanning
 - ** Multi-Format Export**  JSON, CSV, and professional dark-themed HTML reports
 - ** Operational Logging**  Timestamped diagnostic logs with severity levels
 
