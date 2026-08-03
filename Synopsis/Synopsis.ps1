@@ -1,39 +1,3 @@
-<#
-.SYNOPSIS
-    ULTIMATE Hardware Information Collector - Final Edition
-.DESCRIPTION
-    Enterprise-grade hardware information collection with remote scanning,
-    NVMe health, GPU temperature, network advanced properties, and change detection.
-.PARAMETER ExportJSON
-    Export results as JSON file
-.PARAMETER ExportCSV
-    Export results as CSV files
-.PARAMETER ExportHTML
-    Export results as formatted HTML report
-.PARAMETER OutputPath
-    Base path for exports (default: Desktop)
-.PARAMETER IncludePerformance
-    Include comprehensive real-time performance metrics
-.PARAMETER IncludeRegistry
-    Include hardware-related registry information
-.PARAMETER Category
-    Filter to specific hardware category
-.PARAMETER ComputerName
-    Remote computer to scan (requires admin access and WinRM)
-.PARAMETER LogFile
-    Enable diagnostic logging to specified file
-.PARAMETER CompareWith
-    Path to previous JSON export for change detection
-.PARAMETER IncludeAdvancedNetwork
-    Include advanced network adapter properties
-.EXAMPLE
-    .\Get-UltimateHardwareInfo.ps1 -ExportHTML -IncludePerformance
-.EXAMPLE
-    .\Get-UltimateHardwareInfo.ps1 -ComputerName "REMOTE-PC" -ExportJSON
-.EXAMPLE
-    .\Get-UltimateHardwareInfo.ps1 -CompareWith "previous.json" -ExportHTML
-#>
-
 param(
     [switch]$ExportJSON,
     [switch]$ExportCSV,
@@ -46,863 +10,614 @@ param(
     [string]$ComputerName,
     [string]$LogFile,
     [string]$CompareWith,
-    [switch]$IncludeAdvancedNetwork
+    [switch]$IncludeAdvancedNetwork,
+    [int]$ThrottleLimit = 5,
+    [string[]]$ComputerList
 )
 
 #Requires -RunAsAdministrator
 
-# Initialize logging
-if ($LogFile) {
-    $script:LogPath = $LogFile
-    $logMessage = "=== Hardware Scan Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
-    $logMessage | Out-File -FilePath $LogFile
-    if ($ComputerName) {
-        $remoteMsg = "Remote Target: $ComputerName"
-        $remoteMsg | Out-File -FilePath $LogFile -Append
-    }
-}
+$script:LogPath = $LogFile
+$script:StartTime = Get-Date
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    if ($LogFile) {
-        $logEntry = "$(Get-Date -Format 'HH:mm:ss') [$Level] $Message"
-        $logEntry | Out-File -FilePath $LogFile -Append
+    param([string]$M, [string]$L = "INFO")
+    if ($script:LogPath) {
+        "$(Get-Date -Format 'HH:mm:ss.fff') [$L] $M" | Out-File $script:LogPath -Append
     }
 }
 
-# Remote session management
-$script:CimSession = $null
-if ($ComputerName) {
-    try {
-        $script:CimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop
-        $successMsg = "Remote session established to $ComputerName"
-        Write-Log -Message $successMsg -Level "SUCCESS"
-    } catch {
-        $errorMsg = "Failed to connect to ${ComputerName}: $($_.Exception.Message)"
-        Write-Log -Message $errorMsg -Level "ERROR"
-        throw "Remote connection failed: $($_.Exception.Message)"
-    }
-}
-
-function Get-CimData {
-    param(
-        [string]$ClassName,
-        [string]$Namespace = "root/cimv2",
-        [string]$Filter,
-        [string[]]$Properties
-    )
-    
-    $params = @{
-        ClassName = $ClassName
-        Namespace = $Namespace
-        ErrorAction = 'SilentlyContinue'
-    }
-    
-    if ($script:CimSession) { $params.CimSession = $script:CimSession }
-    if ($Properties) { $params.Property = $Properties }
-    if ($Filter) { $params.Filter = $Filter }
-    
-    try {
-        return Get-CimInstance @params
-    } catch {
-        $warnMsg = "CIM query failed for ${ClassName}: $($_.Exception.Message)"
-        Write-Log -Message $warnMsg -Level "WARN"
-        return $null
-    }
-}
-
-# Color definitions
 $colors = @{
-    Header = 'Cyan'
-    Section = 'Yellow'
-    SubSection = 'Magenta'
-    Label = 'Green'
-    Value = 'White'
-    Diff = 'Yellow'
-    Added = 'Green'
-    Removed = 'Red'
-    Warning = 'DarkYellow'
-    Error = 'Red'
-    Success = 'Green'
-    Info = 'Gray'
-    Progress = 'Cyan'
+    H='Cyan'; S='Yellow'; SS='Magenta'; L='Green'; V='White'
+    D='Yellow'; A='Green'; R='Red'; W='DarkYellow'; E='Red'
+    SU='Green'; I='Gray'; P='Cyan'
 }
 
-function Write-ProgressBar {
-    param(
-        [string]$Activity,
-        [string]$Status,
-        [int]$PercentComplete
-    )
-    
-    $barLength = 50
-    $completed = [math]::Floor($PercentComplete / 100 * $barLength)
-    $remaining = $barLength - $completed
-    
-    $bar = "[$("=" * $completed)$(" " * $remaining)]"
-    
-    Write-Host "`r$Activity : " -NoNewline -ForegroundColor $colors.Progress
-    Write-Host $bar -NoNewline -ForegroundColor $colors.Progress
-    Write-Host " $PercentComplete% " -NoNewline -ForegroundColor $colors.Progress
-    Write-Host "- $Status" -ForegroundColor $colors.Info
-    
-    Write-Log -Message "$Activity - $Status ($PercentComplete%)"
+function Write-PB {
+    param([string]$A, [string]$S, [int]$P)
+    $c = [math]::Floor($P/100*50)
+    Write-Host "`r$A : [$('='*$c)$(' '*(50-$c))] $P% - $S" -ForegroundColor $colors.P
 }
 
-function Get-RegistryValue {
-    param([string]$Path, [string]$Name)
+function New-CimSessionSafe {
+    if ($script:CimSession) { return }
+    try {
+        $script:CimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop -SessionOption (New-CimSessionOption -Protocol Dcom)
+        Write-Log "CIM session established" "SUCCESS"
+    } catch {
+        Write-Log "CIM failed: $($_.Exception.Message)" "ERROR"
+        throw
+    }
+}
+
+function Get-Cim {
+    param([string]$C, [string]$NS="root/cimv2", [string]$F, [string[]]$Prop)
+    $p = @{ClassName=$C; Namespace=$NS; ErrorAction='SilentlyContinue'}
+    if ($script:CimSession) {$p.CimSession=$script:CimSession}
+    if ($Prop) {$p.Property=$Prop}
+    if ($F) {$p.Filter=$F}
+    try {Get-CimInstance @p} catch {$null}
+}
+
+function Get-Reg {
+    param([string]$P, [string]$N)
     try {
         if ($script:CimSession) {
-            $result = Invoke-CimMethod -CimSession $script:CimSession -ClassName StdRegProv -MethodName GetStringValue -Arguments @{
-                hDefKey = 2147483650
-                sSubKeyName = $Path -replace '^HKLM:\\', ''
-                sValueName = $Name
-            } -ErrorAction Stop
-            return $result.sValue
+            $r = Invoke-CimMethod -CimSession $script:CimSession -ClassName StdRegProv -MethodName GetStringValue -Arguments @{hDefKey=2147483650; sSubKeyName=$P -replace '^HKLM:\\',''; sValueName=$N} -ErrorAction Stop
+            return $r.sValue
         } else {
-            $result = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
-            return $result.$Name
+            return (Get-ItemProperty -Path $P -Name $N -ErrorAction Stop).$N
         }
-    } catch {
-        return "N/A"
-    }
+    } catch {"N/A"}
 }
 
-function Get-NVMeHealth {
+function Get-SMART {
+    param([string]$SN)
     try {
-        $nvmeDrives = Get-CimData -ClassName MSFT_PhysicalDisk -Namespace "root/microsoft/windows/storage"
-        if (-not $nvmeDrives) { return @() }
-        
-        $nvmeHealth = @()
-        foreach ($drive in $nvmeDrives | Where-Object { $_.MediaType -eq 4 }) {
-            $reliability = Get-CimData -ClassName MSFT_StorageReliabilityCounter -Namespace "root/microsoft/windows/storage" -Filter "DeviceId='$($drive.DeviceId)'"
-            
-            if ($reliability) {
-                $nvmeHealth += [ordered]@{
-                    DeviceId = $drive.DeviceId
-                    FriendlyName = $drive.FriendlyName
-                    MediaType = "NVMe SSD"
-                    Temperature = $drive.Temperature
-                    PowerOnHours = $reliability.PowerOnHours
-                    ReadErrorsTotal = $reliability.ReadErrorsTotal
-                    WriteErrorsTotal = $reliability.WriteErrorsTotal
-                    Wear = $reliability.Wear
-                    ReadLatencyMax = $reliability.ReadLatencyMax
-                    WriteLatencyMax = $reliability.WriteLatencyMax
-                    FlushLatencyMax = $reliability.FlushLatencyMax
+        $pd = Get-Cim -C MSFT_PhysicalDisk -NS "root/microsoft/windows/storage" -F "SerialNumber='$SN'"
+        if (-not $pd) {return $null}
+        [ordered]@{
+            Health=$pd.HealthStatus; OpStatus=$pd.OperationalStatus; Media=$pd.MediaType; Bus=$pd.BusType
+            Temp=if($pd.Temperature){"$($pd.Temperature) C"}else{"N/A"}
+            TempMax=if($pd.TemperatureMax){"$($pd.TemperatureMax) C"}else{"N/A"}
+            Hours=if($pd.PowerOnHours){$pd.PowerOnHours}else{"N/A"}
+            PowerCycles=if($pd.PowerOnCount){$pd.PowerOnCount}else{"N/A"}
+            ReadErrors=if($pd.ReadErrorsTotal){$pd.ReadErrorsTotal}else{"N/A"}
+            WriteErrors=if($pd.WriteErrorsTotal){$pd.WriteErrorsTotal}else{"N/A"}
+            Wear=if($pd.Wear){"$($pd.Wear)%"}else{"N/A"}
+        }
+    } catch {$null}
+}
+
+function Get-NVMe {
+    try {
+        $drives = Get-Cim -C MSFT_PhysicalDisk -NS "root/microsoft/windows/storage" | ? {$_.MediaType -eq 4}
+        if (-not $drives) {return @()}
+        $result = @()
+        foreach ($d in $drives) {
+            $rel = Get-Cim -C MSFT_StorageReliabilityCounter -NS "root/microsoft/windows/storage" -F "DeviceId='$($d.DeviceId)'"
+            if ($rel) {
+                $result += [ordered]@{
+                    Device=$d.FriendlyName; Temp=$d.Temperature; Hours=$rel.PowerOnHours
+                    Wear=$rel.Wear; ReadErrors=$rel.ReadErrorsTotal; WriteErrors=$rel.WriteErrorsTotal
+                    ReadLatMax=$rel.ReadLatencyMax; WriteLatMax=$rel.WriteLatencyMax; FlushLatMax=$rel.FlushLatencyMax
                 }
             }
         }
-        return $nvmeHealth
-    } catch {
-        Write-Log -Message "NVMe health retrieval failed: $($_.Exception.Message)" -Level "WARN"
-        return @()
-    }
+        $result
+    } catch {Write-Log "NVMe failed" "WARN"; @()}
 }
 
-function Get-GPUTemperature {
+function Get-GPUTemp {
     try {
-        $gpuTemps = @()
-        
-        # Try NVIDIA temperature via WMI
+        $temps = @()
         try {
-            $nvidiaTemps = Get-CimData -Namespace "root/wmi" -ClassName "NVThermalSensors"
-            if ($nvidiaTemps) {
-                foreach ($sensor in $nvidiaTemps) {
-                    $gpuTemps += [ordered]@{
-                        GPUName = "NVIDIA GPU"
-                        Temperature = "$([math]::Round($sensor.ThermalSensors / 1000, 1)) C"
-                        Method = "NVIDIA Direct"
+            $nv = Get-Cim -NS "root/wmi" -C "NVThermalSensors"
+            if ($nv) {
+                foreach ($s in $nv) {
+                    $temps += [ordered]@{Name="NVIDIA"; Temp="$([math]::Round($s.ThermalSensors/1000,1)) C"; Method="Direct"}
+                }
+            }
+        } catch {Write-Log "NVIDIA temp N/A" "DEBUG"}
+        try {
+            $amd = Get-Cim -NS "root/wmi" -C "AMD_Thermal"
+            if ($amd) {
+                foreach ($s in $amd) {
+                    $temps += [ordered]@{Name="AMD"; Temp="$([math]::Round($s.Temperature/1000,1)) C"; Method="Direct"}
+                }
+            }
+        } catch {Write-Log "AMD temp N/A" "DEBUG"}
+        try {
+            $pc = Get-Counter "\GPU Engine(*)\Utilization Percentage" -EA 0
+            if ($pc) {
+                $groups = $pc.CounterSamples | Group {($_.Path -split '\\')[3]}
+                foreach ($g in $groups) {
+                    $avg = ($g.Group | Measure CookedValue -Average).Average
+                    if ($avg -gt 0) {
+                        $temps += [ordered]@{Name=($g.Name -replace '_',' '); Util="$( [math]::Round($avg,2))%"; Method="PerfCounter"}
                     }
                 }
             }
-        } catch {
-            Write-Log -Message "NVIDIA temp retrieval failed" -Level "DEBUG"
-        }
-        
-        # Try via performance counters
-        try {
-            $perfCounters = Get-Counter "\GPU Engine(*)\Utilization Percentage" -ErrorAction SilentlyContinue
-            if ($perfCounters) {
-                $gpuGroups = $perfCounters.CounterSamples | Group-Object -Property { ($_.Path -split '\\')[3] }
-                foreach ($group in $gpuGroups) {
-                    $avgUtil = ($group.Group | Measure-Object -Property CookedValue -Average).Average
-                    if ($avgUtil -gt 0) {
-                        $gpuTemps += [ordered]@{
-                            GPUName = ($group.Name -replace '_',' ')
-                            UtilizationPercent = [math]::Round($avgUtil, 2)
-                            Method = "Performance Counter"
-                        }
-                    }
-                }
-            }
-        } catch {
-            Write-Log -Message "GPU perf counter retrieval failed" -Level "DEBUG"
-        }
-        
-        return $gpuTemps
-    } catch {
-        Write-Log -Message "GPU temperature retrieval failed: $($_.Exception.Message)" -Level "WARN"
-        return @()
-    }
+        } catch {}
+        $temps
+    } catch {@()}
 }
 
-function Get-AdvancedNetworkProperties {
-    param($NetworkAdapter)
-    
+function Get-AdvNet {
+    param($Adapter)
     try {
-        $advancedProps = @{}
-        $adapterKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
-        
+        $props = @{}
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
         if (-not $script:CimSession) {
-            $subKeys = Get-ChildItem -Path $adapterKey -ErrorAction SilentlyContinue
-            if ($subKeys) {
-                foreach ($key in $subKeys) {
-                    $driverDesc = Get-RegistryValue -Path $key.PSPath -Name "DriverDesc"
-                    if ($driverDesc -ne "N/A" -and $NetworkAdapter.Name -like "*$driverDesc*") {
-                        $advancedProps.JumboPacket = Get-RegistryValue -Path $key.PSPath -Name "*JumboPacket"
-                        $advancedProps.VlanID = Get-RegistryValue -Path $key.PSPath -Name "VlanID"
-                        $advancedProps.RSSEnabled = Get-RegistryValue -Path $key.PSPath -Name "*RSS"
-                        $advancedProps.TCPOffload = Get-RegistryValue -Path $key.PSPath -Name "*TCPUDPChecksumOffloadIPv4"
-                        $advancedProps.LargeSendOffload = Get-RegistryValue -Path $key.PSPath -Name "*LsoV2IPv4"
-                        $advancedProps.ReceiveBuffers = Get-RegistryValue -Path $key.PSPath -Name "*ReceiveBuffers"
-                        $advancedProps.TransmitBuffers = Get-RegistryValue -Path $key.PSPath -Name "*TransmitBuffers"
-                        $advancedProps.WakeOnMagicPacket = Get-RegistryValue -Path $key.PSPath -Name "*WakeOnMagicPacket"
-                        $advancedProps.EnergyEfficientEthernet = Get-RegistryValue -Path $key.PSPath -Name "*EEELinkAdvertisement"
+            $subs = Get-ChildItem $key -EA 0
+            if ($subs) {
+                foreach ($k in $subs) {
+                    $desc = Get-Reg $k.PSPath "DriverDesc"
+                    if ($desc -ne "N/A" -and $Adapter.Name -like "*$desc*") {
+                        $props.Jumbo=Get-Reg $k.PSPath "*JumboPacket"
+                        $props.VLAN=Get-Reg $k.PSPath "VlanID"
+                        $props.RSS=Get-Reg $k.PSPath "*RSS"
+                        $props.TCPChk=Get-Reg $k.PSPath "*TCPUDPChecksumOffloadIPv4"
+                        $props.LSO=Get-Reg $k.PSPath "*LsoV2IPv4"
+                        $props.RxBuf=Get-Reg $k.PSPath "*ReceiveBuffers"
+                        $props.TxBuf=Get-Reg $k.PSPath "*TransmitBuffers"
+                        $props.WoL=Get-Reg $k.PSPath "*WakeOnMagicPacket"
+                        $props.EEE=Get-Reg $k.PSPath "*EEELinkAdvertisement"
                         break
                     }
                 }
             }
         }
-        
-        return if ($advancedProps.Count -gt 0) { $advancedProps } else { $null }
-    } catch {
-        return $null
-    }
+        if ($props.Count -gt 0) {$props} else {$null}
+    } catch {$null}
 }
 
-function Get-SMARTData {
-    param([string]$SerialNumber)
-    
+function Get-PCI {
+    param([int]$Max=50)
     try {
-        $smartData = @{}
-        $physicalDisk = Get-CimData -ClassName MSFT_PhysicalDisk -Namespace "root/microsoft/windows/storage" -Filter "SerialNumber='$SerialNumber'"
-        
-        if ($physicalDisk) {
-            $smartData.HealthStatus = $physicalDisk.HealthStatus
-            $smartData.OperationalStatus = $physicalDisk.OperationalStatus
-            $smartData.MediaType = $physicalDisk.MediaType
-            $smartData.BusType = $physicalDisk.BusType
-            $smartData.Temperature = if ($physicalDisk.Temperature) { "$($physicalDisk.Temperature) C" } else { "N/A" }
-            $smartData.TemperatureMax = if ($physicalDisk.TemperatureMax) { "$($physicalDisk.TemperatureMax) C" } else { "N/A" }
-            $smartData.PowerOnHours = if ($physicalDisk.PowerOnHours) { $physicalDisk.PowerOnHours } else { "N/A" }
-            $smartData.PowerOnCount = if ($physicalDisk.PowerOnCount) { $physicalDisk.PowerOnCount } else { "N/A" }
-            $smartData.ReadErrorsTotal = if ($physicalDisk.ReadErrorsTotal) { $physicalDisk.ReadErrorsTotal } else { "N/A" }
-            $smartData.WriteErrorsTotal = if ($physicalDisk.WriteErrorsTotal) { $physicalDisk.WriteErrorsTotal } else { "N/A" }
-            $smartData.Wear = if ($physicalDisk.Wear) { "$($physicalDisk.Wear)%" } else { "N/A" }
+        $devs = Get-Cim -C Win32_PnPEntity | ? {$_.PNPDeviceID -match '^(PCI|ACPI|SCSI|USB)\\VEN_'} | select -First $Max
+        if (-not $devs) {return @()}
+        $devs | % {
+            [ordered]@{
+                Name=if($_.Name){$_.Name}else{"Unknown"}
+                PNPID=$_.PNPDeviceID; Class=if($_.PNPClass){$_.PNPClass}else{"N/A"}
+                Mfr=if($_.Manufacturer){$_.Manufacturer}else{"N/A"}
+                Driver=if($_.DriverVersion){$_.DriverVersion}else{"N/A"}
+                DriverDate=if($_.DriverDate){$_.DriverDate}else{"N/A"}
+                Status=$_.Status
+            }
         }
-        
-        return if ($smartData.Count -gt 0) { $smartData } else { $null }
-    } catch {
-        return $null
-    }
+    } catch {@()}
 }
 
-function Get-PCIDevices {
-    param([int]$MaxDevices = 100)
-    
+function Get-Perf {
     try {
-        $pciDevices = Get-CimData -ClassName Win32_PnPEntity | 
-            Where-Object { $_.PNPDeviceID -match '^(PCI|ACPI|SCSI|USB)\\VEN_' } |
-            Select-Object -First $MaxDevices
-        
-        $pciArray = @()
-        if ($pciDevices) {
-            foreach ($device in $pciDevices) {
-                $pciArray += [ordered]@{
-                    Name = if ($device.Name) { $device.Name } else { "Unknown Device" }
-                    DeviceID = $device.DeviceID
-                    PNPDeviceID = $device.PNPDeviceID
-                    Status = $device.Status
-                    Manufacturer = if ($device.Manufacturer) { $device.Manufacturer } else { "N/A" }
-                    Class = if ($device.PNPClass) { $device.PNPClass } else { "N/A" }
-                    DriverVersion = if ($device.DriverVersion) { $device.DriverVersion } else { "N/A" }
-                    DriverDate = if ($device.DriverDate) { $device.DriverDate } else { "N/A" }
-                }
+        [ordered]@{
+            CPU=[ordered]@{
+                Util=[math]::Round((Get-Counter "\Processor(_Total)\% Processor Time" -EA 0).CounterSamples.CookedValue,2)
+                DPC=[math]::Round((Get-Counter "\Processor(_Total)\DPCs Queued/sec" -EA 0).CounterSamples.CookedValue,2)
+                IntPS=[math]::Round((Get-Counter "\Processor(_Total)\Interrupts/sec" -EA 0).CounterSamples.CookedValue,2)
+                CtxSw=[math]::Round((Get-Counter "\System\Context Switches/sec" -EA 0).CounterSamples.CookedValue,2)
+            }
+            Memory=[ordered]@{
+                AvailMB=[math]::Round((Get-Counter "\Memory\Available MBytes" -EA 0).CounterSamples.CookedValue,2)
+                CommitGB=[math]::Round((Get-Counter "\Memory\Committed Bytes" -EA 0).CounterSamples.CookedValue/1GB,2)
+                LimitGB=[math]::Round((Get-Counter "\Memory\Commit Limit" -EA 0).CounterSamples.CookedValue/1GB,2)
+                PageFaults=[math]::Round((Get-Counter "\Memory\Page Faults/sec" -EA 0).CounterSamples.CookedValue,2)
+                PoolPagedMB=[math]::Round((Get-Counter "\Memory\Pool Paged Bytes" -EA 0).CounterSamples.CookedValue/1MB,2)
+                PoolNonPagedMB=[math]::Round((Get-Counter "\Memory\Pool Nonpaged Bytes" -EA 0).CounterSamples.CookedValue/1MB,2)
+                CacheMB=[math]::Round((Get-Counter "\Memory\Cache Bytes" -EA 0).CounterSamples.CookedValue/1MB,2)
+            }
+            Disk=[ordered]@{
+                QueueLen=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Current Disk Queue Length" -EA 0).CounterSamples.CookedValue,2)
+                ReadMBs=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Disk Read Bytes/sec" -EA 0).CounterSamples.CookedValue/1MB,2)
+                WriteMBs=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Disk Write Bytes/sec" -EA 0).CounterSamples.CookedValue/1MB,2)
+                ReadLatMs=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Avg. Disk sec/Read" -EA 0).CounterSamples.CookedValue*1000,2)
+                WriteLatMs=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Avg. Disk sec/Write" -EA 0).CounterSamples.CookedValue*1000,2)
+                SplitIO=[math]::Round((Get-Counter "\PhysicalDisk(_Total)\Split IO/Sec" -EA 0).CounterSamples.CookedValue,2)
+            }
+            Network=[ordered]@{
+                MBs=[math]::Round((Get-Counter "\Network Interface(_Total)\Bytes Total/sec" -EA 0).CounterSamples.CookedValue/1MB,2)
+                Pkts=[math]::Round((Get-Counter "\Network Interface(_Total)\Packets/sec" -EA 0).CounterSamples.CookedValue,2)
+                Discard=[math]::Round((Get-Counter "\Network Interface(_Total)\Packets Outbound Discarded" -EA 0).CounterSamples.CookedValue,2)
+                BwMbps=[math]::Round((Get-Counter "\Network Interface(_Total)\Current Bandwidth" -EA 0).CounterSamples.CookedValue/1e6,2)
+            }
+            System=[ordered]@{
+                Procs=(Get-Counter "\System\Processes" -EA 0).CounterSamples.CookedValue
+                Threads=(Get-Counter "\System\Threads" -EA 0).CounterSamples.CookedValue
+                Handles=(Get-Counter "\System\Handles" -EA 0).CounterSamples.CookedValue
+                UpSec=(Get-Counter "\System\System Up Time" -EA 0).CounterSamples.CookedValue
             }
         }
-        return $pciArray
-    } catch {
-        return @()
-    }
+    } catch {$null}
 }
 
-function Get-ComprehensivePerformanceData {
+function Get-DriverUpdates {
     try {
-        $perfData = [ordered]@{
-            CPU = [ordered]@{
-                TotalUtilization = [math]::Round((Get-Counter "\Processor(_Total)\% Processor Time" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                DPCsPerSec = [math]::Round((Get-Counter "\Processor(_Total)\DPCs Queued/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                InterruptsPerSec = [math]::Round((Get-Counter "\Processor(_Total)\Interrupts/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                ContextSwitchesPerSec = [math]::Round((Get-Counter "\System\Context Switches/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-            }
-            Memory = [ordered]@{
-                AvailableMB = [math]::Round((Get-Counter "\Memory\Available MBytes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                CommittedGB = [math]::Round((Get-Counter "\Memory\Committed Bytes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1GB, 2)
-                CommitLimitGB = [math]::Round((Get-Counter "\Memory\Commit Limit" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1GB, 2)
-                PageFaultsPerSec = [math]::Round((Get-Counter "\Memory\Page Faults/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                PoolPagedMB = [math]::Round((Get-Counter "\Memory\Pool Paged Bytes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-                PoolNonPagedMB = [math]::Round((Get-Counter "\Memory\Pool Nonpaged Bytes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-                CacheBytesMB = [math]::Round((Get-Counter "\Memory\Cache Bytes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-            }
-            Disk = [ordered]@{
-                CurrentQueueLength = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Current Disk Queue Length" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                ReadMBPerSec = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Disk Read Bytes/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-                WriteMBPerSec = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Disk Write Bytes/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-                AvgReadLatencyMs = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Avg. Disk sec/Read" -ErrorAction SilentlyContinue).CounterSamples.CookedValue * 1000, 2)
-                AvgWriteLatencyMs = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Avg. Disk sec/Write" -ErrorAction SilentlyContinue).CounterSamples.CookedValue * 1000, 2)
-                SplitIOPerSec = [math]::Round((Get-Counter "\PhysicalDisk(_Total)\Split IO/Sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-            }
-            Network = [ordered]@{
-                TotalMBPerSec = [math]::Round((Get-Counter "\Network Interface(_Total)\Bytes Total/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1MB, 2)
-                PacketsPerSec = [math]::Round((Get-Counter "\Network Interface(_Total)\Packets/sec" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                PacketsOutboundDiscarded = [math]::Round((Get-Counter "\Network Interface(_Total)\Packets Outbound Discarded" -ErrorAction SilentlyContinue).CounterSamples.CookedValue, 2)
-                CurrentBandwidthMbps = [math]::Round((Get-Counter "\Network Interface(_Total)\Current Bandwidth" -ErrorAction SilentlyContinue).CounterSamples.CookedValue / 1000000, 2)
-            }
-            System = [ordered]@{
-                Processes = (Get-Counter "\System\Processes" -ErrorAction SilentlyContinue).CounterSamples.CookedValue
-                Threads = (Get-Counter "\System\Threads" -ErrorAction SilentlyContinue).CounterSamples.CookedValue
-                Handles = (Get-Counter "\System\Handles" -ErrorAction SilentlyContinue).CounterSamples.CookedValue
-                UpTimeSeconds = (Get-Counter "\System\System Up Time" -ErrorAction SilentlyContinue).CounterSamples.CookedValue
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searcher.ServerSelection = 3
+        $results = $searcher.Search("IsInstalled=0 AND Type='Driver'")
+        $updates = @()
+        if ($results.Updates.Count -gt 0) {
+            $results.Updates | select -First 20 | % {
+                $updates += [ordered]@{Title=$_.Title; DriverClass=$_.Categories.Name; Date=$_.LastDeploymentChangeTime}
             }
         }
-        return $perfData
-    } catch {
-        return $null
-    }
+        if ($updates.Count -gt 0) {$updates} else {$null}
+    } catch {$null}
 }
 
-function Compare-HardwareChanges {
-    param($Current, $PreviousPath)
+function Get-Hardware {
+    param([string]$Cat='All', [switch]$Perf, [switch]$Reg, [switch]$AdvNet)
     
-    try {
-        $previous = Get-Content $PreviousPath -ErrorAction Stop | ConvertFrom-Json
-        $changes = [ordered]@{}
-        
-        foreach ($section in $Current.Keys) {
-            if ($section -notin $previous.PSObject.Properties.Name) {
-                $changes.$section = [ordered]@{ Status = "NEW" }
-            }
-        }
-        foreach ($section in $previous.PSObject.Properties.Name) {
-            if ($section -notin $Current.Keys) {
-                $changes.$section = [ordered]@{ Status = "REMOVED" }
-            }
-        }
-        
-        return if ($changes.Count -gt 0) { $changes } else { $null }
-    } catch {
-        Write-Log -Message "Change detection failed: $($_.Exception.Message)" -Level "WARN"
-        return $null
-    }
-}
-
-function Get-UltimateHardwareInfo {
-    param(
-        [string]$FilterCategory = 'All',
-        [switch]$IncludePerf,
-        [switch]$IncludeReg,
-        [switch]$IncludeAdvNet
-    )
-    
-    $hardwareInfo = [ordered]@{}
-    $totalSteps = 30
-    $currentStep = 0
+    $info = [ordered]@{}
+    $step = 0; $total = 28
     
     Write-Host ""
-    Write-Log -Message "Starting hardware information collection" -Level "INFO"
+    Write-Log "Scan started" "INFO"
     
-    # System Information
-    if ($FilterCategory -in @('System','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] System Information" -Status "Gathering system details..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $cs = Get-CimData -ClassName Win32_ComputerSystem
-        $csProduct = Get-CimData -ClassName Win32_ComputerSystemProduct
-        
-        if ($cs) {
-            $hardwareInfo.System = [ordered]@{
-                Manufacturer = $cs.Manufacturer
-                Model = $cs.Model
-                SystemFamily = if ($cs.SystemFamily) { $cs.SystemFamily } else { "N/A" }
-                SystemSKU = if ($cs.SystemSKUNumber) { $cs.SystemSKUNumber } else { "N/A" }
-                UUID = if ($csProduct.UUID) { $csProduct.UUID } else { "N/A" }
-                TotalPhysicalMemoryGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
-                NumberOfProcessors = $cs.NumberOfProcessors
-                NumberOfLogicalProcessors = $cs.NumberOfLogicalProcessors
-                HypervisorPresent = $cs.HypervisorPresent
-                DNSHostName = $cs.DNSHostName
-            }
+    if ($Cat -in @('System','All')) {
+        $step++; Write-PB "[$step/$total] System" "Gathering..." ([math]::Round($step/$total*100))
+        $cs = Get-Cim -C Win32_ComputerSystem
+        $csp = Get-Cim -C Win32_ComputerSystemProduct
+        $bios = Get-Cim -C Win32_BIOS
+        $bb = Get-Cim -C Win32_BaseBoard
+        $info.System = [ordered]@{
+            Mfr=$cs.Manufacturer; Model=$cs.Model; UUID=if($csp.UUID){$csp.UUID}else{"N/A"}
+            RAM_GB=[math]::Round($cs.TotalPhysicalMemory/1GB,2); CPUs=$cs.NumberOfProcessors
+            LogicalCPUs=$cs.NumberOfLogicalProcessors; HyperV=$cs.HypervisorPresent; Host=$cs.DNSHostName
         }
-        
-        $bios = Get-CimData -ClassName Win32_BIOS
-        if ($bios) {
-            $hardwareInfo.BIOS = [ordered]@{
-                Manufacturer = $bios.Manufacturer
-                Version = $bios.SMBIOSBIOSVersion
-                SMBIOSVersion = "$($bios.SMBIOSMajorVersion).$($bios.SMBIOSMinorVersion)"
-                ReleaseDate = $bios.ReleaseDate
-                SerialNumber = $bios.SerialNumber
-            }
-        }
-        
-        $bb = Get-CimData -ClassName Win32_BaseBoard
-        if ($bb) {
-            $hardwareInfo.Motherboard = [ordered]@{
-                Manufacturer = $bb.Manufacturer
-                Product = $bb.Product
-                Version = $bb.Version
-                SerialNumber = $bb.SerialNumber
-                SKU = if ($bb.SKU) { $bb.SKU } else { "N/A" }
-            }
-        }
-        Write-Log -Message "System information collected" -Level "SUCCESS"
+        $info.BIOS = [ordered]@{Mfr=$bios.Manufacturer; Ver=$bios.SMBIOSBIOSVersion; Date=$bios.ReleaseDate; SN=$bios.SerialNumber}
+        $info.Motherboard = [ordered]@{Mfr=$bb.Manufacturer; Product=$bb.Product; Ver=$bb.Version; SN=$bb.SerialNumber}
     }
     
-    # CPU Information
-    if ($FilterCategory -in @('CPU','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Processors" -Status "Analyzing CPU architecture..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $processors = Get-CimData -ClassName Win32_Processor
-        $cpuArray = @()
-        
-        if ($processors) {
-            foreach ($cpu in $processors) {
-                $cpuArray += [ordered]@{
-                    Name = if ($cpu.Name) { $cpu.Name -replace '\s+', ' ' } else { "N/A" }
-                    Manufacturer = $cpu.Manufacturer
-                    Architecture = switch ($cpu.Architecture) {
-                        0 { "x86" }; 9 { "x64" }; 12 { "ARM64" }
-                        default { "Unknown" }
-                    }
-                    MaxClockSpeed = "$($cpu.MaxClockSpeed) MHz"
-                    NumberOfCores = $cpu.NumberOfCores
-                    NumberOfLogicalProcessors = $cpu.NumberOfLogicalProcessors
-                    L2CacheSize = if ($cpu.L2CacheSize) { "$($cpu.L2CacheSize) KB" } else { "N/A" }
-                    L3CacheSize = if ($cpu.L3CacheSize) { "$($cpu.L3CacheSize) KB" } else { "N/A" }
-                    Socket = $cpu.SocketDesignation
-                    VirtualizationFirmwareEnabled = $cpu.VirtualizationFirmwareEnabled
-                    LoadPercentage = "$($cpu.LoadPercentage)%"
+    if ($Cat -in @('CPU','All')) {
+        $step++; Write-PB "[$step/$total] CPU" "Analyzing..." ([math]::Round($step/$total*100))
+        $cpus = Get-Cim -C Win32_Processor
+        $cpuArr = @()
+        if ($cpus) {
+            foreach ($c in $cpus) {
+                $cpuArr += [ordered]@{
+                    Name=($c.Name -replace '\s+',' '); Arch=switch($c.Architecture){0{"x86"}9{"x64"}12{"ARM64"}default{"?"}}
+                    MaxMHz=$c.MaxClockSpeed; Cores=$c.NumberOfCores; Logical=$c.NumberOfLogicalProcessors
+                    L2=if($c.L2CacheSize){"$($c.L2CacheSize)KB"}else{"N/A"}
+                    L3=if($c.L3CacheSize){"$($c.L3CacheSize)KB"}else{"N/A"}
+                    Socket=$c.SocketDesignation; VT=$c.VirtualizationFirmwareEnabled; Load="$($c.LoadPercentage)%"
                 }
             }
         }
-        $hardwareInfo.CPU = $cpuArray
-        Write-Log -Message "CPU information collected ($($cpuArray.Count) processors)" -Level "SUCCESS"
+        $info.CPU = $cpuArr
     }
     
-    # Memory Information
-    if ($FilterCategory -in @('Memory','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Memory Modules" -Status "Detecting RAM configuration..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $physicalMemory = Get-CimData -ClassName Win32_PhysicalMemory
-        
-        $memoryArray = @()
-        if ($physicalMemory) {
-            foreach ($memory in $physicalMemory) {
-                $memoryArray += [ordered]@{
-                    Manufacturer = $memory.Manufacturer
-                    PartNumber = $memory.PartNumber
-                    SerialNumber = $memory.SerialNumber
-                    CapacityGB = [math]::Round($memory.Capacity / 1GB, 2)
-                    Speed = "$($memory.Speed) MHz"
-                    ConfiguredClockSpeed = "$($memory.ConfiguredClockSpeed) MHz"
-                    FormFactor = switch ($memory.FormFactor) {
-                        8 { "DIMM" }; 12 { "SODIMM" }; 24 { "FB-DIMM" }
-                        default { $memory.FormFactor }
-                    }
-                    MemoryType = switch ($memory.MemoryType) {
-                        20 { "DDR" }; 21 { "DDR2" }; 24 { "DDR3" }
-                        26 { "DDR4" }; 34 { "DDR5" }
-                        default { $memory.MemoryType }
-                    }
-                    DeviceLocator = $memory.DeviceLocator
-                    BankLabel = $memory.BankLabel
-                    ConfiguredVoltage = if ($memory.ConfiguredVoltage) { 
-                        [math]::Round($memory.ConfiguredVoltage / 1000, 3).ToString() + " V" 
-                    } else { "N/A" }
+    if ($Cat -in @('Memory','All')) {
+        $step++; Write-PB "[$step/$total] RAM" "Detecting..." ([math]::Round($step/$total*100))
+        $mem = Get-Cim -C Win32_PhysicalMemory
+        $memArr = @()
+        if ($mem) {
+            foreach ($m in $mem) {
+                $memArr += [ordered]@{
+                    Mfr=$m.Manufacturer; PN=$m.PartNumber; SN=$m.SerialNumber
+                    GB=[math]::Round($m.Capacity/1GB,2); MHz=$m.Speed
+                    FF=switch($m.FormFactor){8{"DIMM"}12{"SODIMM"}default{$m.FormFactor}}
+                    Type=switch($m.MemoryType){20{"DDR"}21{"DDR2"}24{"DDR3"}26{"DDR4"}34{"DDR5"}default{$m.MemoryType}}
+                    Slot=$m.DeviceLocator; Bank=$m.BankLabel
+                    V=if($m.ConfiguredVoltage){"$([math]::Round($m.ConfiguredVoltage/1000,3))V"}else{"N/A"}
                 }
             }
         }
-        $hardwareInfo.Memory = $memoryArray
-        Write-Log -Message "Memory information collected ($($memoryArray.Count) modules)" -Level "SUCCESS"
+        $info.Memory = $memArr
     }
     
-    # GPU Information
-    if ($FilterCategory -in @('GPU','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Graphics Adapters" -Status "Analyzing GPU configuration..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $videoControllers = Get-CimData -ClassName Win32_VideoController
-        $gpuArray = @()
-        
-        if ($videoControllers) {
-            foreach ($gpu in $videoControllers) {
-                $gpuArray += [ordered]@{
-                    Name = $gpu.Name
-                    AdapterRAM = if ($gpu.AdapterRAM) { [math]::Round($gpu.AdapterRAM / 1GB, 2).ToString() + " GB" } else { "N/A" }
-                    DriverVersion = $gpu.DriverVersion
-                    DriverDate = $gpu.DriverDate
-                    VideoModeDescription = $gpu.VideoModeDescription
-                    CurrentRefreshRate = "$($gpu.CurrentRefreshRate) Hz"
-                    CurrentHorizontalResolution = $gpu.CurrentHorizontalResolution
-                    CurrentVerticalResolution = $gpu.CurrentVerticalResolution
-                    VideoProcessor = $gpu.VideoProcessor
-                    Status = $gpu.Status
+    if ($Cat -in @('GPU','All')) {
+        $step++; Write-PB "[$step/$total] GPU" "Analyzing..." ([math]::Round($step/$total*100))
+        $vc = Get-Cim -C Win32_VideoController
+        $gpuArr = @()
+        if ($vc) {
+            foreach ($g in $vc) {
+                $gpuArr += [ordered]@{
+                    Name=$g.Name; RAM=if($g.AdapterRAM){"$([math]::Round($g.AdapterRAM/1GB,2))GB"}else{"N/A"}
+                    Driver=$g.DriverVersion; Date=$g.DriverDate; Mode=$g.VideoModeDescription
+                    Hz="$($g.CurrentRefreshRate)Hz"; Res="$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
+                    VPU=$g.VideoProcessor; Status=$g.Status
                 }
             }
         }
-        $hardwareInfo.GPU = $gpuArray
-        
-        if ($IncludePerf) {
-            $gpuPerf = Get-GPUTemperature
-            if ($gpuPerf.Count -gt 0) {
-                $hardwareInfo.GPUPerformance = $gpuPerf
-            }
+        $info.GPU = $gpuArr
+        if ($Perf) {
+            $gt = Get-GPUTemp
+            if ($gt.Count -gt 0) {$info.GPUPerf = $gt}
         }
-        Write-Log -Message "GPU information collected ($($gpuArray.Count) adapters)" -Level "SUCCESS"
     }
     
-    # Disk Information
-    if ($FilterCategory -in @('Disk','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Disk Drives" -Status "Scanning storage with health data..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $diskDrives = Get-CimData -ClassName Win32_DiskDrive
-        $diskArray = @()
-        
-        if ($diskDrives) {
-            foreach ($disk in $diskDrives) {
-                $partitions = Get-CimAssociatedInstance -InputObject $disk -ResultClassName Win32_DiskPartition -ErrorAction SilentlyContinue
-                $partitionInfo = @()
-                if ($partitions) {
-                    foreach ($partition in $partitions) {
-                        $logicalDisks = Get-CimAssociatedInstance -InputObject $partition -ResultClassName Win32_LogicalDisk -ErrorAction SilentlyContinue
-                        if ($logicalDisks) {
-                            foreach ($logicalDisk in $logicalDisks) {
-                                if ($logicalDisk.DeviceID) {
-                                    $partitionInfo += [ordered]@{
-                                        DriveLetter = $logicalDisk.DeviceID
-                                        VolumeName = if ($logicalDisk.VolumeName) { $logicalDisk.VolumeName } else { "N/A" }
-                                        SizeGB = if ($logicalDisk.Size) { [math]::Round($logicalDisk.Size / 1GB, 2) } else { "N/A" }
-                                        FreeSpaceGB = if ($logicalDisk.FreeSpace) { [math]::Round($logicalDisk.FreeSpace / 1GB, 2) } else { "N/A" }
-                                        PercentFree = if ($logicalDisk.Size -and $logicalDisk.Size -gt 0) { 
-                                            [math]::Round(($logicalDisk.FreeSpace / $logicalDisk.Size) * 100, 2)
-                                        } else { "N/A" }
-                                        FileSystem = $logicalDisk.FileSystem
+    if ($Cat -in @('Disk','All')) {
+        $step++; Write-PB "[$step/$total] Disks" "Scanning..." ([math]::Round($step/$total*100))
+        $disks = Get-Cim -C Win32_DiskDrive
+        $diskArr = @()
+        if ($disks) {
+            foreach ($d in $disks) {
+                $parts = Get-CimAssociatedInstance -InputObject $d -ResultClassName Win32_DiskPartition -EA 0
+                $partInfo = @()
+                if ($parts) {
+                    foreach ($p in $parts) {
+                        $ld = Get-CimAssociatedInstance -InputObject $p -ResultClassName Win32_LogicalDisk -EA 0
+                        if ($ld) {
+                            foreach ($l in $ld) {
+                                if ($l.DeviceID) {
+                                    $partInfo += [ordered]@{
+                                        Drive=$l.DeviceID; Label=if($l.VolumeName){$l.VolumeName}else{"N/A"}
+                                        GB=if($l.Size){[math]::Round($l.Size/1GB,2)}else{"N/A"}
+                                        Free=if($l.FreeSpace){[math]::Round($l.FreeSpace/1GB,2)}else{"N/A"}
+                                        FreePct=if($l.Size-and$l.Size-gt0){[math]::Round($l.FreeSpace/$l.Size*100,2)}else{"N/A"}
+                                        FS=$l.FileSystem
                                     }
                                 }
                             }
                         }
                     }
                 }
-                
-                $diskInfo = [ordered]@{
-                    Model = if ($disk.Model) { $disk.Model -replace '\s+', ' ' } else { "N/A" }
-                    Manufacturer = $disk.Manufacturer
-                    SizeGB = if ($disk.Size) { [math]::Round($disk.Size / 1GB, 2) } else { "N/A" }
-                    InterfaceType = $disk.InterfaceType
-                    MediaType = $disk.MediaType
-                    SerialNumber = $disk.SerialNumber
-                    FirmwareRevision = $disk.FirmwareRevision
-                    Partitions = $partitionInfo
+                $di = [ordered]@{
+                    Model=($d.Model -replace '\s+',' '); Mfr=$d.Manufacturer
+                    GB=if($d.Size){[math]::Round($d.Size/1GB,2)}else{"N/A"}
+                    Interface=$d.InterfaceType; Media=$d.MediaType; SN=$d.SerialNumber; FW=$d.FirmwareRevision
+                    Partitions=$partInfo
                 }
-                
-                $smartData = Get-SMARTData -SerialNumber $disk.SerialNumber
-                if ($smartData) {
-                    $diskInfo.SMART = $smartData
-                }
-                
-                $diskArray += $diskInfo
+                $smart = Get-SMART $d.SerialNumber
+                if ($smart) {$di.SMART = $smart}
+                $diskArr += $di
             }
         }
-        $hardwareInfo.Disks = $diskArray
-        
-        $nvmeHealth = Get-NVMeHealth
-        if ($nvmeHealth.Count -gt 0) {
-            $hardwareInfo.NVMeHealth = $nvmeHealth
-        }
-        Write-Log -Message "Disk information collected ($($diskArray.Count) drives)" -Level "SUCCESS"
+        $info.Disks = $diskArr
+        $nvme = Get-NVMe
+        if ($nvme.Count -gt 0) {$info.NVMe = $nvme}
     }
     
-    # Network Information
-    if ($FilterCategory -in @('Network','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Network Adapters" -Status "Scanning network configuration..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $networkAdapters = Get-CimData -ClassName Win32_NetworkAdapter | Where-Object { $_.PhysicalAdapter -eq $true }
-        $networkArray = @()
-        
-        if ($networkAdapters) {
-            foreach ($adapter in $networkAdapters) {
-                $adapterConfig = Get-CimData -ClassName Win32_NetworkAdapterConfiguration -Filter "Index=$($adapter.Index)"
-                
-                $netInfo = [ordered]@{
-                    Name = $adapter.Name
-                    ProductName = $adapter.ProductName
-                    Manufacturer = $adapter.Manufacturer
-                    MACAddress = $adapter.MACAddress
-                    Speed = if ($adapter.Speed -and $adapter.Speed -gt 0) { 
-                        if ($adapter.Speed -ge 1000000000) { [math]::Round($adapter.Speed / 1000000000, 2).ToString() + " Gbps" }
-                        else { [math]::Round($adapter.Speed / 1000000, 2).ToString() + " Mbps" }
-                    } else { "N/A" }
-                    Status = $adapter.Status
-                    NetConnectionStatus = switch ($adapter.NetConnectionStatus) {
-                        0 { "Disconnected" }; 2 { "Connected" }; 7 { "Media Disconnected" }
-                        default { $adapter.NetConnectionStatus }
-                    }
+    if ($Cat -in @('Network','All')) {
+        $step++; Write-PB "[$step/$total] Network" "Scanning..." ([math]::Round($step/$total*100))
+        $adapters = Get-Cim -C Win32_NetworkAdapter | ? {$_.PhysicalAdapter}
+        $netArr = @()
+        if ($adapters) {
+            foreach ($a in $adapters) {
+                $cfg = Get-Cim -C Win32_NetworkAdapterConfiguration -F "Index=$($a.Index)"
+                $ni = [ordered]@{
+                    Name=$a.Name; Product=$a.ProductName; Mfr=$a.Manufacturer; MAC=$a.MACAddress
+                    Speed=if($a.Speed-and$a.Speed-gt0){if($a.Speed-ge1e9){"$([math]::Round($a.Speed/1e9,2))Gbps"}else{"$([math]::Round($a.Speed/1e6,2))Mbps"}}else{"N/A"}
+                    Status=$a.Status; Conn=switch($a.NetConnectionStatus){0{"Disconnected"}2{"Connected"}default{$a.NetConnectionStatus}}
                 }
-                
-                if ($adapterConfig) {
-                    $netInfo.IPAddress = if ($adapterConfig.IPAddress) { $adapterConfig.IPAddress -join ', ' } else { "N/A" }
-                    $netInfo.DefaultGateway = if ($adapterConfig.DefaultIPGateway) { $adapterConfig.DefaultIPGateway -join ', ' } else { "N/A" }
-                    $netInfo.DHCPEnabled = $adapterConfig.DHCPEnabled
-                    $netInfo.DNSServers = if ($adapterConfig.DNSServerSearchOrder) { $adapterConfig.DNSServerSearchOrder -join ', ' } else { "N/A" }
+                if ($cfg) {
+                    $ni.IP=if($cfg.IPAddress){$cfg.IPAddress -join ','}else{"N/A"}
+                    $ni.GW=if($cfg.DefaultIPGateway){$cfg.DefaultIPGateway -join ','}else{"N/A"}
+                    $ni.DHCP=$cfg.DHCPEnabled
+                    $ni.DNS=if($cfg.DNSServerSearchOrder){$cfg.DNSServerSearchOrder -join ','}else{"N/A"}
                 }
-                
-                if ($IncludeAdvNet) {
-                    $advancedProps = Get-AdvancedNetworkProperties -NetworkAdapter $adapter
-                    if ($advancedProps) {
-                        $netInfo.AdvancedProperties = $advancedProps
-                    }
+                if ($AdvNet) {
+                    $ap = Get-AdvNet $a
+                    if ($ap) {$ni.Advanced = $ap}
                 }
-                
-                $networkArray += $netInfo
+                $netArr += $ni
             }
         }
-        $hardwareInfo.Network = $networkArray
-        Write-Log -Message "Network information collected ($($networkArray.Count) adapters)" -Level "SUCCESS"
+        $info.Network = $netArr
     }
     
-    # PCI Devices
-    if ($FilterCategory -in @('All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] PCI Devices" -Status "Enumerating PCI bus..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $pciDevices = Get-PCIDevices -MaxDevices 50
-        if ($pciDevices.Count -gt 0) {
-            $hardwareInfo.PCIDevices = $pciDevices
-        }
-        Write-Log -Message "PCI devices enumerated ($($pciDevices.Count) devices)" -Level "SUCCESS"
-    }
-    
-    # Additional peripherals
-    if ($FilterCategory -in @('All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Peripherals" -Status "Detecting peripheral devices..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
+    if ($Cat -in @('All')) {
+        $step++; Write-PB "[$step/$total] PCI" "Enumerating..." ([math]::Round($step/$total*100))
+        $pci = Get-PCI
+        if ($pci.Count -gt 0) {$info.PCI = $pci}
         
+        $step++; Write-PB "[$step/$total] Peripherals" "Checking..." ([math]::Round($step/$total*100))
         try {
-            $tpm = Get-CimData -ClassName Win32_Tpm -Namespace "root/cimv2/Security/MicrosoftTpm"
-            if ($tpm) {
-                $hardwareInfo.TPM = [ordered]@{
-                    IsActivated = $tpm.IsActivated_InitialValue
-                    IsEnabled = $tpm.IsEnabled_InitialValue
-                    SpecVersion = $tpm.SpecVersion
+            $tpm = Get-Cim -C Win32_Tpm -NS "root/cimv2/Security/MicrosoftTpm"
+            if ($tpm) {$info.TPM = [ordered]@{Active=$tpm.IsActivated_InitialValue; Enabled=$tpm.IsEnabled_InitialValue; Spec=$tpm.SpecVersion}}
+        } catch {}
+        try {
+            $bat = Get-Cim -C Win32_Battery
+            if ($bat) {
+                $info.Battery = [ordered]@{
+                    Charge="$($bat.EstimatedChargeRemaining)%"
+                    Chem=$bat.Chemistry; Design=$bat.DesignCapacity; Full=$bat.FullChargeCapacity
+                    Status=switch($bat.BatteryStatus){1{"Discharging"}2{"AC"}3{"Full"}6{"Charging"}default{"?"}}
                 }
             }
         } catch {}
-        
-        try {
-            $battery = Get-CimData -ClassName Win32_Battery
-            if ($battery) {
-                $hardwareInfo.Battery = [ordered]@{
-                    EstimatedChargeRemaining = "$($battery.EstimatedChargeRemaining)%"
-                    Chemistry = $battery.Chemistry
-                    DesignCapacity = $battery.DesignCapacity
-                    FullChargeCapacity = $battery.FullChargeCapacity
-                    BatteryStatus = switch ($battery.BatteryStatus) {
-                        1 { "Discharging" }; 2 { "AC Power" }; 3 { "Fully Charged" }
-                        6 { "Charging" }
-                        default { "Unknown" }
-                    }
-                }
-            }
-        } catch {}
-        Write-Log -Message "Peripherals collected" -Level "SUCCESS"
     }
     
-    # Registry Information
-    if ($IncludeReg) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Registry Data" -Status "Reading hardware registry keys..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        
-        $regInfo = [ordered]@{
-            ProcessorNameString = Get-RegistryValue -Path "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0" -Name "ProcessorNameString"
-            SystemBiosVersion = Get-RegistryValue -Path "HKLM:\HARDWARE\DESCRIPTION\System" -Name "SystemBiosVersion"
-            BaseBoardManufacturer = Get-RegistryValue -Path "HKLM:\HARDWARE\DESCRIPTION\System\BIOS" -Name "BaseBoardManufacturer"
-            BaseBoardProduct = Get-RegistryValue -Path "HKLM:\HARDWARE\DESCRIPTION\System\BIOS" -Name "BaseBoardProduct"
+    if ($Reg) {
+        $step++; Write-PB "[$step/$total] Registry" "Reading..." ([math]::Round($step/$total*100))
+        $info.Registry = [ordered]@{
+            CPU=Get-Reg "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0" "ProcessorNameString"
+            BIOS=Get-Reg "HKLM:\HARDWARE\DESCRIPTION\System" "SystemBiosVersion"
+            BoardMfr=Get-Reg "HKLM:\HARDWARE\DESCRIPTION\System\BIOS" "BaseBoardManufacturer"
+            BoardProd=Get-Reg "HKLM:\HARDWARE\DESCRIPTION\System\BIOS" "BaseBoardProduct"
         }
-        $hardwareInfo.RegistryHardwareInfo = $regInfo
-        Write-Log -Message "Registry information collected" -Level "SUCCESS"
     }
     
-    # Performance Metrics
-    if ($IncludePerf) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Performance Metrics" -Status "Collecting real-time performance data..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
+    if ($Perf) {
+        $step++; Write-PB "[$step/$total] Performance" "Collecting..." ([math]::Round($step/$total*100))
+        $pd = Get-Perf
+        if ($pd) {$info.Performance = $pd}
         
-        $perfData = Get-ComprehensivePerformanceData
-        if ($perfData) {
-            $hardwareInfo.PerformanceCounters = $perfData
-        }
-        Write-Log -Message "Performance metrics collected" -Level "SUCCESS"
+        $step++; Write-PB "[$step/$total] Driver Updates" "Checking..." ([math]::Round($step/$total*100))
+        $du = Get-DriverUpdates
+        if ($du) {$info.DriverUpdates = $du}
     }
     
-    # Operating System
-    if ($FilterCategory -in @('System','All')) {
-        $currentStep++
-        Write-ProgressBar -Activity "[$currentStep/$totalSteps] Operating System" -Status "Reading OS configuration..." -PercentComplete ([math]::Round($currentStep/$totalSteps * 100))
-        $os = Get-CimData -ClassName Win32_OperatingSystem
-        
+    if ($Cat -in @('System','All')) {
+        $step++; Write-PB "[$step/$total] OS" "Reading..." ([math]::Round($step/$total*100))
+        $os = Get-Cim -C Win32_OperatingSystem
         if ($os) {
-            $hardwareInfo.OperatingSystem = [ordered]@{
-                Name = $os.Name
-                Version = $os.Version
-                BuildNumber = $os.BuildNumber
-                Architecture = $os.OSArchitecture
-                InstallDate = $os.InstallDate
-                LastBootUpTime = $os.LastBootUpTime
-                FreePhysicalMemoryGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
-                TotalVisibleMemoryGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
-                NumberOfProcesses = $os.NumberOfProcesses
+            $info.OS = [ordered]@{
+                Name=$os.Name; Ver=$os.Version; Build=$os.BuildNumber; Arch=$os.OSArchitecture
+                Installed=$os.InstallDate; Boot=$os.LastBootUpTime
+                FreeGB=[math]::Round($os.FreePhysicalMemory/1MB,2); TotalGB=[math]::Round($os.TotalVisibleMemorySize/1MB,2)
+                Procs=$os.NumberOfProcesses
             }
         }
-        Write-Log -Message "OS information collected" -Level "SUCCESS"
     }
     
-    # Finalize
-    for ($i = $currentStep + 1; $i -le $totalSteps; $i++) {
-        Write-ProgressBar -Activity "[$i/$totalSteps] Finalizing" -Status "Compiling report..." -PercentComplete ([math]::Round($i/$totalSteps * 100))
-        Start-Sleep -Milliseconds 100
+    for ($i=$step+1; $i-le$total; $i++) {
+        Write-PB "[$i/$total]" "Finalizing..." ([math]::Round($i/$total*100))
+        Start-Sleep -Milliseconds 80
     }
-    
     Write-Host ""
-    Write-Log -Message "Hardware information collection completed" -Level "SUCCESS"
-    
-    if ($script:CimSession) {
-        Remove-CimSession -CimSession $script:CimSession
-        Write-Log -Message "Remote session closed" -Level "INFO"
-    }
-    
-    return $hardwareInfo
+    Write-Log "Scan complete" "SUCCESS"
+    if ($script:CimSession) {Remove-CimSession $script:CimSession}
+    return $info
 }
 
-# Main Execution
-Clear-Host
-Write-Host ""
-Write-Host "======================================================================" -ForegroundColor $colors.Header
-Write-Host "     ULTIMATE HARDWARE SCANNER - FINAL EDITION" -ForegroundColor $colors.Header
-Write-Host "======================================================================" -ForegroundColor $colors.Header
-if ($ComputerName) {
-    Write-Host "     Remote Target: $ComputerName" -ForegroundColor $colors.Highlight
+function Compare-Data {
+    param($New, $Path)
+    try {
+        $old = Get-Content $Path -EA Stop | ConvertFrom-Json
+        $diffs = @()
+        foreach ($s in $New.Keys) {
+            if ($s -in $old.PSObject.Properties.Name) {
+                $nval = ($New[$s] | ConvertTo-Json -Compress -Depth 5)
+                $oval = ($old.$s | ConvertTo-Json -Compress -Depth 5)
+                if ($nval -ne $oval) {$diffs += "$s : MODIFIED"}
+            } else {$diffs += "$s : NEW"}
+        }
+        foreach ($s in $old.PSObject.Properties.Name) {
+            if ($s -notin $New.Keys) {$diffs += "$s : REMOVED"}
+        }
+        if ($diffs.Count -gt 0) {$diffs} else {$null}
+    } catch {$null}
 }
-Write-Host ""
 
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-
-try {
-    $hardwareData = Get-UltimateHardwareInfo `
-        -FilterCategory $Category `
-        -IncludePerf:$IncludePerformance `
-        -IncludeReg:$IncludeRegistry `
-        -IncludeAdvNet:$IncludeAdvancedNetwork
-    
-    # Change detection
-    if ($CompareWith) {
-        Write-Host "Comparing with previous snapshot: $CompareWith" -ForegroundColor $colors.Info
-        $changes = Compare-HardwareChanges -Current $hardwareData -PreviousPath $CompareWith
-        if ($changes) {
-            Write-Host "`n=== HARDWARE CHANGES DETECTED ===" -ForegroundColor $colors.Warning
-            foreach ($change in $changes.Keys) {
-                Write-Host "  $change : $($changes[$change].Status)" -ForegroundColor $colors.Diff
+function Out-HTML {
+    param($D, $P)
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $rows = ""
+    foreach ($s in $D.Keys) {
+        if ($s -eq 'ChangesDetected') {continue}
+        $rows += "<h2>$s</h2>"
+        if ($D[$s] -is [array]) {
+            if ($D[$s].Count -eq 0) {$rows += "<p><i>No data</i></p>"; continue}
+            $props = $D[$s][0].Keys
+            $rows += "<table><tr>$(($props | % {"<th>$_</th>"}) -join '')</tr>"
+            foreach ($item in $D[$s]) {
+                $rows += "<tr>"
+                foreach ($k in $props) {
+                    $v = $item[$k]
+                    $cls = if ($v -match '^(Healthy|OK|Connected)$') {' class="ok"'} elseif ($v -match '^(Error|Disconnected|Critical)$') {' class="bad"'} else {''}
+                    $rows += "<td$cls>$v</td>"
+                }
+                $rows += "</tr>"
             }
-            $hardwareData.ChangesDetected = $changes
-        } else {
-            Write-Host "No hardware changes detected" -ForegroundColor $colors.Success
+            $rows += "</table>"
+        } elseif ($D[$s] -is [System.Collections.Specialized.OrderedDictionary]) {
+            $rows += "<table>"
+            foreach ($k in $D[$s].Keys) {
+                $v = $D[$s][$k]
+                if ($v -isnot [System.Collections.Specialized.OrderedDictionary] -and $v -isnot [array]) {
+                    $rows += "<tr><th>$k</th><td>$v</td></tr>"
+                }
+            }
+            $rows += "</table>"
         }
     }
-    
-    # Exports
-    if ($ExportJSON) {
-        $jsonPath = Join-Path $OutputPath "UltimateHardwareInfo_$timestamp.json"
-        Write-Host "`nExporting JSON: $jsonPath" -ForegroundColor $colors.Info
-        $hardwareData | ConvertTo-Json -Depth 20 | Out-File -FilePath $jsonPath -Encoding UTF8
-        Write-Host "JSON export complete ($([math]::Round((Get-Item $jsonPath).Length / 1KB, 2)) KB)" -ForegroundColor $colors.Success
-    }
-    
-    if ($ExportCSV) {
-        $csvPath = Join-Path $OutputPath "HardwareCSV_$timestamp"
-        New-Item -ItemType Directory -Path $csvPath -Force | Out-Null
-        Write-Host "`nExporting CSV: $csvPath" -ForegroundColor $colors.Info
-        
-        foreach ($section in $hardwareData.Keys) {
-            if ($hardwareData[$section] -is [array] -and $hardwareData[$section].Count -gt 0) {
-                $sectionPath = Join-Path $csvPath "$section.csv"
-                $hardwareData[$section] | ForEach-Object {
-                    $obj = [PSCustomObject]@{}
-                    foreach ($key in $_.Keys) {
-                        $value = $_[$key]
-                        if ($value -is [System.Collections.Specialized.OrderedDictionary]) {
-                            $value = $value | ConvertTo-Json -Compress
-                        }
-                        $obj | Add-Member -NotePropertyName $key -NotePropertyValue $value
-                    }
-                    $obj
-                } | Export-Csv -Path $sectionPath -NoTypeInformation
-            }
-        }
-        Write-Host "CSV export complete" -ForegroundColor $colors.Success
-    }
-    
-    if ($ExportHTML) {
-        $htmlPath = Join-Path $OutputPath "UltimateHardwareReport_$timestamp.html"
-        Write-Host "`nGenerating HTML report: $htmlPath" -ForegroundColor $colors.Info
-        # HTML generation (simplified for reliability)
-        $htmlContent = @"
+@"
 <!DOCTYPE html>
-<html>
-<head><title>Hardware Report - $timestamp</title></head>
-<body>
-<h1>Ultimate Hardware Information Report</h1>
-<p>Generated: $(Get-Date)</p>
-<pre>$($hardwareData | ConvertTo-Json -Depth 10)</pre>
-</body>
-</html>
-"@
-        $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8
-        Write-Host "HTML report generated" -ForegroundColor $colors.Success
+<html><head><meta charset="UTF-8"><title>Hardware Report $ts</title>
+<style>body{font:14px Segoe UI,sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0}
+h1{color:#00d4ff;border-bottom:2px solid #00d4ff}h2{color:#7b2ff7;background:#16213e;padding:10px;border-radius:5px;margin-top:25px}
+table{width:100%;border-collapse:collapse;margin:10px 0;background:#0f3460}
+th{background:#533483;padding:8px;text-align:left}td{padding:6px 8px;border-bottom:1px solid #16213e}
+tr:hover{background:#1a1a4e}.ok{color:#00ff88}.bad{color:#ff4757}
+</style></head><body>
+<h1>Ultimate Hardware Report</h1><p>Generated: $ts | Duration: $([math]::Round(((Get-Date)-$script:StartTime).TotalSeconds,1))s</p>
+$rows
+</body></html>
+"@ | Out-File $P -Encoding UTF8
+}
+
+# Main
+Clear-Host
+Write-Host "`n$('='*70)`n  ULTIMATE HARDWARE SCANNER v3.0`n$('='*70)" -ForegroundColor Cyan
+if ($ComputerName) {Write-Host "  Target: $ComputerName" -ForegroundColor Blue}
+if ($ComputerList) {Write-Host "  Batch: $($ComputerList.Count) systems" -ForegroundColor Blue}
+
+if ($ComputerName) {New-CimSessionSafe}
+$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+if ($ComputerList) {
+    $allResults = @{}
+    foreach ($comp in $ComputerList) {
+        Write-Host "`n--- $comp ---" -ForegroundColor Yellow
+        $ComputerName = $comp
+        $script:CimSession = $null
+        New-CimSessionSafe
+        $allResults[$comp] = Get-Hardware -Cat $Category -Perf:$IncludePerformance -Reg:$IncludeRegistry -AdvNet:$IncludeAdvancedNetwork
+        if ($script:CimSession) {Remove-CimSession $script:CimSession}
     }
-    
-    # Console summary
-    if (-not ($ExportJSON -or $ExportCSV -or $ExportHTML)) {
-        Write-Host "`n=== HARDWARE INVENTORY SUMMARY ===" -ForegroundColor $colors.Header
-        foreach ($section in $hardwareData.Keys) {
-            if ($section -eq 'ChangesDetected') { continue }
-            Write-Host "`n[ $section ]" -ForegroundColor $colors.Section
-            if ($hardwareData[$section] -is [array]) {
-                Write-Host "  Items: $($hardwareData[$section].Count)" -ForegroundColor $colors.Info
-            } elseif ($hardwareData[$section] -is [System.Collections.Specialized.OrderedDictionary]) {
-                foreach ($key in $hardwareData[$section].Keys) {
-                    $val = $hardwareData[$section][$key]
-                    if ($val -isnot [System.Collections.Specialized.OrderedDictionary] -and $val -isnot [array]) {
-                        Write-Host "  $key : $val" -ForegroundColor $colors.Value
+    if ($ExportJSON) {
+        $jp = Join-Path $OutputPath "BatchHardware_$ts.json"
+        $allResults | ConvertTo-Json -Depth 10 | Out-File $jp -Encoding UTF8
+        Write-Host "`nBatch exported: $jp" -ForegroundColor Green
+    }
+} else {
+    try {
+        $data = Get-Hardware -Cat $Category -Perf:$IncludePerformance -Reg:$IncludeRegistry -AdvNet:$IncludeAdvancedNetwork
+        
+        if ($CompareWith) {
+            $diffs = Compare-Data $data $CompareWith
+            if ($diffs) {
+                Write-Host "`n=== CHANGES ===" -ForegroundColor Yellow
+                $diffs | % {Write-Host $_ -ForegroundColor Magenta}
+                $data.ChangesDetected = $diffs
+            } else {Write-Host "`nNo changes detected" -ForegroundColor Green}
+        }
+        
+        if ($ExportJSON) {
+            $jp = Join-Path $OutputPath "Hardware_$ts.json"
+            $data | ConvertTo-Json -Depth 20 | Out-File $jp -Encoding UTF8
+            Write-Host "JSON: $jp ($([math]::Round((Get-Item $jp).Length/1KB,1))KB)" -ForegroundColor Green
+        }
+        if ($ExportCSV) {
+            $cp = Join-Path $OutputPath "HardwareCSV_$ts"
+            New-Item -ItemType Directory $cp -Force | Out-Null
+            foreach ($s in $data.Keys) {
+                if ($data[$s] -is [array] -and $data[$s].Count -gt 0) {
+                    $data[$s] | % {
+                        $o = [PSCustomObject]@{}
+                        foreach ($k in $_.Keys) {
+                            $v = $_[$k]
+                            if ($v -is [System.Collections.Specialized.OrderedDictionary]) {$v = $v | ConvertTo-Json -Compress}
+                            $o | Add-Member -NotePropertyName $k -NotePropertyValue $v
+                        }
+                        $o
+                    } | Export-Csv (Join-Path $cp "$s.csv") -NoTypeInformation
+                }
+            }
+            Write-Host "CSV: $cp" -ForegroundColor Green
+        }
+        if ($ExportHTML) {
+            $hp = Join-Path $OutputPath "HardwareReport_$ts.html"
+            Out-HTML $data $hp
+            Write-Host "HTML: $hp ($([math]::Round((Get-Item $hp).Length/1KB,1))KB)" -ForegroundColor Green
+        }
+        
+        if (-not ($ExportJSON -or $ExportCSV -or $ExportHTML)) {
+            Write-Host "`n=== SUMMARY ===`n" -ForegroundColor Cyan
+            foreach ($s in $data.Keys) {
+                if ($s -eq 'ChangesDetected') {continue}
+                Write-Host "[$s]" -ForegroundColor Yellow
+                if ($data[$s] -is [array]) {
+                    Write-Host "  Items: $($data[$s].Count)" -ForegroundColor Gray
+                } elseif ($data[$s] -is [System.Collections.Specialized.OrderedDictionary]) {
+                    foreach ($k in $data[$s].Keys) {
+                        $v = $data[$s][$k]
+                        if ($v -isnot [System.Collections.Specialized.OrderedDictionary] -and $v -isnot [array]) {
+                            Write-Host "  $k : $v" -ForegroundColor White
+                        }
                     }
                 }
             }
         }
+        Write-Host "`n$('='*70)`n  COMPLETE ($([math]::Round(((Get-Date)-$script:StartTime).TotalSeconds,1))s)`n$('='*70)" -ForegroundColor Green
+    } catch {
+        Write-Host "`nFATAL: $($_.Exception.Message)" -ForegroundColor Red
+        if ($script:CimSession) {Remove-CimSession $script:CimSession}
+        exit 1
     }
-    
-    Write-Host "`n======================================================================" -ForegroundColor $colors.Header
-    Write-Host "     SCAN COMPLETED SUCCESSFULLY" -ForegroundColor $colors.Success
-    Write-Host "======================================================================" -ForegroundColor $colors.Header
-    
-} catch {
-    Write-Host "`nCRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor $colors.Error
-    Write-Log -Message "CRITICAL ERROR: $($_.Exception.Message)" -Level "ERROR"
-    if ($script:CimSession) { Remove-CimSession -CimSession $script:CimSession }
-    exit 1
 }
